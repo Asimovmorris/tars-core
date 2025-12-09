@@ -1,0 +1,272 @@
+# tars/clients/openai_client.py
+
+import io
+from typing import List, Dict, Optional
+
+from openai import OpenAI
+
+from tars.config.settings import load_settings, TARS_PROMPT_PATH
+from tars.utils.logging import get_logger
+
+logger = get_logger(__name__)
+_settings = load_settings()
+_client = OpenAI(api_key=_settings.openai_api_key)
+
+
+def load_tars_system_prompt() -> str:
+    """
+    Load the TARS system prompt from the configured path.
+    This is executed once at import-time and cached in TARS_SYSTEM_PROMPT.
+    """
+    try:
+        with open(TARS_PROMPT_PATH, "r", encoding="utf-8") as f:
+            prompt = f.read().strip()
+    except Exception as e:
+        logger.error(f"Failed to load TARS system prompt from {TARS_PROMPT_PATH}: {e}")
+        raise
+    if not prompt:
+        logger.error("TARS system prompt is empty after loading.")
+        raise RuntimeError("TARS system prompt is empty.")
+    return prompt
+
+
+TARS_SYSTEM_PROMPT = load_tars_system_prompt()
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers to read config with safeguards
+# ---------------------------------------------------------------------------
+
+def _get_chat_model() -> str:
+    model = (_settings.openai_model or "").strip()
+    if not model:
+        logger.warning(
+            "openai_model is empty in settings; falling back to 'gpt-4.1-mini'."
+        )
+        return "gpt-4.1-mini"
+    return model
+
+
+def _get_stt_model() -> str:
+    model = (_settings.openai_stt_model or "").strip()
+    if not model:
+        logger.warning(
+            "openai_stt_model is empty in settings; falling back to 'whisper-1'."
+        )
+        return "whisper-1"
+    return model
+
+
+def _get_tts_model() -> str:
+    model = (_settings.openai_tts_model or "").strip()
+    if not model:
+        logger.warning(
+            "openai_tts_model is empty in settings; falling back to 'gpt-4o-mini-tts'."
+        )
+        return "gpt-4o-mini-tts"
+    return model
+
+
+def _get_tts_voice() -> str:
+    voice = (_settings.openai_tts_voice or "").strip()
+    if not voice:
+        logger.warning(
+            "openai_tts_voice is empty in settings; falling back to 'alloy'."
+        )
+        return "alloy"
+    return voice
+
+
+def _get_tts_audio_format() -> str:
+    fmt = (_settings.openai_tts_audio_format or "").strip().lower()
+    if not fmt:
+        logger.warning(
+            "openai_tts_audio_format is empty in settings; falling back to 'mp3'."
+        )
+        fmt = "mp3"
+    # audio.service will enforce supported formats; here we just normalize
+    return fmt
+
+
+# ---------------------------------------------------------------------------
+# Chat (text) API
+# ---------------------------------------------------------------------------
+
+def chat_with_tars(messages: List[Dict[str, str]]) -> str:
+    """
+    Call the OpenAI chat model with the TARS system prompt automatically prepended.
+
+    Parameters
+    ----------
+    messages : List[Dict[str, str]]
+        Sequence of chat messages, each a dict with:
+            {"role": "user" | "assistant" | "system", "content": "..."}
+
+        You should NOT include the main TARS system prompt yourself; it is
+        injected automatically as the first "system" message.
+
+    Returns
+    -------
+    str
+        The assistant's reply text.
+
+    Raises
+    ------
+    RuntimeError
+        If the OpenAI API call fails or returns an unusable response.
+    """
+    full_messages = [{"role": "system", "content": TARS_SYSTEM_PROMPT}] + messages
+    model_name = _get_chat_model()
+
+    try:
+        response = _client.chat.completions.create(
+            model=model_name,
+            messages=full_messages,
+        )
+    except Exception as e:
+        logger.error(f"OpenAI chat API call failed (model={model_name!r}): {e}")
+        raise RuntimeError("TARS encountered an error contacting the model.") from e
+
+    try:
+        choice = response.choices[0]
+        content = choice.message.content
+    except Exception as e:
+        logger.error(f"Unexpected response format from OpenAI: {response!r}")
+        raise RuntimeError(
+            "TARS received an unexpected response format from the model."
+        ) from e
+
+    if not content or not content.strip():
+        logger.error("Empty content received from OpenAI response.")
+        raise RuntimeError("TARS received an empty response from the model.")
+
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers (STT and TTS) for TARS Voice 1.0
+# ---------------------------------------------------------------------------
+
+def transcribe_audio(
+    audio_bytes: bytes,
+    mime_type: Optional[str] = None,
+    language: Optional[str] = None,
+) -> str:
+    """
+    Transcribe audio to text using OpenAI's speech-to-text (Whisper-based) API.
+
+    This is a synchronous helper intended to be called from the audio pipeline.
+
+    Parameters
+    ----------
+    audio_bytes : bytes
+        Raw audio file contents (e.g. WAV/MP3/OGG).
+    mime_type : Optional[str]
+        MIME type hint, e.g. "audio/wav" or "audio/mpeg". Currently optional;
+        the API primarily uses the file content itself.
+    language : Optional[str]
+        Optional language code (e.g. "en"). If None, the API auto-detects.
+
+    Returns
+    -------
+    str
+        The transcribed text.
+
+    Raises
+    ------
+    RuntimeError
+        If the transcription request fails or returns an unusable response.
+    """
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = "input_audio.wav"
+
+    model_name = _get_stt_model()
+
+    try:
+        # Whisper STT
+        resp = _client.audio.transcriptions.create(
+            model=model_name,
+            file=audio_file,
+            language=language,
+        )
+    except Exception as e:
+        logger.error(f"OpenAI audio transcription failed (model={model_name!r}): {e}")
+        raise RuntimeError("TARS failed to transcribe the audio input.") from e
+
+    try:
+        text = resp.text  # new SDK: .text attribute
+    except Exception as e:
+        logger.error(f"Unexpected transcription response format: {resp!r}")
+        raise RuntimeError(
+            "TARS received an unexpected transcription response format."
+        ) from e
+
+    if not text or not text.strip():
+        logger.error("Empty transcription text received from OpenAI.")
+        raise RuntimeError("TARS received an empty transcription from the model.")
+
+    return text.strip()
+
+
+def synthesize_speech(
+    text: str,
+    voice: Optional[str] = None,
+    audio_format: Optional[str] = None,
+) -> bytes:
+    """
+    Synthesize speech from text using OpenAI's text-to-speech API.
+
+    Parameters
+    ----------
+    text : str
+        The text to speak.
+    voice : Optional[str]
+        Optional voice preset name. If None, falls back to config default.
+    audio_format : Optional[str]
+        Output audio format, e.g. "mp3", "wav".
+        If None, falls back to config default.
+
+    Returns
+    -------
+    bytes
+        The raw audio data.
+
+    Raises
+    ------
+    RuntimeError
+        If the TTS request fails or returns an unusable response.
+    ValueError
+        If `text` is empty.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise ValueError("Cannot synthesize speech from empty text.")
+
+    model_name = _get_tts_model()
+    voice_name = voice or _get_tts_voice()
+    fmt = (audio_format or _get_tts_audio_format()).lower()
+
+    try:
+        # Correct parameter is 'response_format'
+        response = _client.audio.speech.create(
+            model=model_name,
+            voice=voice_name,
+            input=cleaned,
+            response_format=fmt,
+        )
+        audio_bytes = response.read()
+    except Exception as e:
+        logger.error(
+            "OpenAI text-to-speech failed (model=%r, voice=%r, format=%r): %s",
+            model_name,
+            voice_name,
+            fmt,
+            e,
+        )
+        raise RuntimeError("TARS failed to synthesize speech from text.") from e
+
+    if not audio_bytes:
+        logger.error("Empty audio bytes received from OpenAI TTS.")
+        raise RuntimeError("TARS received an empty audio response from the model.")
+
+    return audio_bytes
