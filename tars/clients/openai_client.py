@@ -13,16 +13,35 @@ from tars.utils.logging import get_logger
 logger = get_logger(__name__)
 _settings = load_settings()
 
-# Configure legacy OpenAI Python SDK (0.28.x style)
-openai.api_key = _settings.openai_api_key
-# If you ever use a proxy / different base URL, you can set OPENAI_BASE_URL in .env
-_openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com").rstrip("/")
+# ---------------------------------------------------------------------------
+# OpenAI base configuration (legacy SDK 0.28.x)
+# ---------------------------------------------------------------------------
 
+if not _settings.openai_api_key:
+    # Hard fail early: nothing will work without this
+    raise RuntimeError("OPENAI_API_KEY is not set in settings/.env")
+
+openai.api_key = _settings.openai_api_key
+
+# Prefer settings.openai_api_base, then env var, then default.
+_openai_base_url = (
+    getattr(_settings, "openai_api_base", None)
+    or os.getenv("OPENAI_BASE_URL")
+    or "https://api.openai.com"
+).rstrip("/")
+
+# If you want the SDK to also use a custom base (e.g. proxy), set api_base.
+openai.api_base = _openai_base_url
+
+
+# ---------------------------------------------------------------------------
+# System prompt loader
+# ---------------------------------------------------------------------------
 
 def load_tars_system_prompt() -> str:
     """
     Load the TARS system prompt from the configured path.
-    This is executed once at import-time and cached in TARS_SYSTEM_PROMPT.
+    Executed once at import-time and cached in TARS_SYSTEM_PROMPT.
     """
     try:
         with open(TARS_PROMPT_PATH, "r", encoding="utf-8") as f:
@@ -68,7 +87,7 @@ def _get_stt_model() -> str:
 
 
 def _get_tts_model() -> str:
-    # This is used by the raw HTTP TTS call to /v1/audio/speech
+    # This is used by the raw HTTP TTS call to /v1/audio/speech.
     model = getattr(_settings, "openai_tts_model", "") or ""
     model = model.strip()
     if not model:
@@ -98,7 +117,7 @@ def _get_tts_audio_format() -> str:
             "openai_tts_audio_format is empty in settings; falling back to 'mp3'."
         )
         fmt = "mp3"
-    # audio.service will enforce supported formats; here we just normalize
+    # audio.service will enforce supported formats; here we just normalize.
     return fmt
 
 
@@ -133,7 +152,7 @@ def chat_with_tars(messages: List[Dict[str, str]]) -> str:
     model_name = _get_chat_model()
 
     try:
-        # Legacy SDK: ChatCompletion.create(...)
+        # Legacy SDK: ChatCompletion.create(...).
         response = openai.ChatCompletion.create(
             model=model_name,
             messages=full_messages,
@@ -199,7 +218,7 @@ def transcribe_audio(
     model_name = _get_stt_model()
 
     try:
-        # Legacy SDK: Audio.transcribe(...)
+        # Legacy SDK: Audio.transcribe(...).
         resp = openai.Audio.transcribe(
             model=model_name,
             file=audio_file,
@@ -210,7 +229,7 @@ def transcribe_audio(
         raise RuntimeError("TARS failed to transcribe the audio input.") from e
 
     try:
-        # Legacy API returns a dict-like object: {'text': '...'}
+        # Legacy API returns a dict-like object: {'text': '...'}.
         text = resp["text"] if isinstance(resp, dict) else getattr(resp, "text", "")
     except Exception as e:
         logger.error(f"Unexpected transcription response format: {resp!r}")
