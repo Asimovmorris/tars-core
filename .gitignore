@@ -24,3 +24,9 @@ Thumbs.db
 
 # SQLite DBs (optional, but you might want to version them later)
 tars/data/*.db
+
+# --- TARS runtime artifacts (local only) ---
+tars/logs/
+tars/memory/sessions/
+tars_stt_test.wav
+=

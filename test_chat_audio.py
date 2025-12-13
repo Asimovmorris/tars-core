@@ -27,6 +27,9 @@ Design practices:
  10) Human-oriented summary instead of raw JSON blob.
 """
 
+import os
+
+BASE_URL = os.getenv("TARS_BASE_URL", "http://Koinor-vpn:8000").rstrip("/")
 import argparse
 import base64
 import json
