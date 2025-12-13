@@ -18,13 +18,16 @@ Design practices applied:
 8. Stable API semantics (POST for side-effects, GET for reads).
 9. Centralized error handling boundaries around model calls.
 10. Extensibility for mode, language, and now voice_style + reply-length control.
+11. NEW: Session memory persisted in JSONL keyed by session_id for /chat_audio.
 """
 
 import base64
+import json
 import re
 import time
 import uuid
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, constr
@@ -114,6 +117,8 @@ class AudioChatRequest(BaseModel):
     language     : optional STT language hint, e.g. "en" or "es" (None = auto)
     mode         : optional reasoning mode hint, e.g. "analyst", "critic", "synthetic"
     voice_style  : optional style hint for spoken replies, e.g. "brief", "story", "technical"
+    session_id   : client-provided session identifier (Android already sends this)
+    channel      : optional channel hint (default "VOICE")
     """
     audio_base64: constr(min_length=1) = Field(
         ...,
@@ -141,6 +146,17 @@ class AudioChatRequest(BaseModel):
             "Optional voice style hint for spoken reply, e.g. 'brief', 'story', 'technical'. "
             "If omitted, TARS uses a default concise voice hint and reply-length limits."
         ),
+    )
+
+    # ✅ session-aware continuity
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Client session identifier for persistent conversation across turns.",
+    )
+
+    channel: Optional[str] = Field(
+        default="VOICE",
+        description="Optional channel hint (VOICE/TEXT); VOICE default.",
     )
 
 
@@ -230,9 +246,7 @@ def _split_sentences_basic(text: str) -> List[str]:
     if not text:
         return []
 
-    # Split on end-of-sentence punctuation followed by whitespace
     parts = re.split(r"(?<=[.!?])\s+", text)
-    # Merge empty fragments and strip whitespace
     sentences = [p.strip() for p in parts if p.strip()]
     return sentences
 
@@ -267,20 +281,17 @@ def _truncate_for_voice_reply(
     # 2) Sentence-based truncation (soft)
     sentences = _split_sentences_basic(original)
     if not sentences:
-        # No obvious sentence structure; fallback to char-based only
         truncated = original[:max_chars_soft].rstrip()
         was_truncated = len(truncated) < len(original)
         return truncated, was_truncated
 
     if len(sentences) <= max_sentences and len(original) <= max_chars_soft:
-        # Already within limits
         return original, False
 
-    # Build text from first N sentences
     selected = sentences[:max_sentences]
     truncated_text = " ".join(selected).strip()
 
-    # 3) Apply soft char limit on the truncated text
+    # 3) Apply soft char limit
     if len(truncated_text) > max_chars_soft:
         truncated_text = truncated_text[:max_chars_soft].rstrip()
 
@@ -296,9 +307,6 @@ def _truncate_for_voice_reply(
 def chat_text(req: ChatRequest) -> ChatResponse:
     """
     Send a text message to TARS and get a reply + current reasoning mode.
-
-    This endpoint is the canonical text interface and is used as the
-    underlying engine for audio as well.
     """
     request_id = str(uuid.uuid4())
     start_time = time.monotonic()
@@ -308,20 +316,12 @@ def chat_text(req: ChatRequest) -> ChatResponse:
         reply = tars_core.process_user_text(req.message, channel=ResponseChannel.TEXT)
         mode = tars_core.state.mode.value
         if not reply or not reply.strip():
-            logger.error(
-                "[chat_text] Empty reply for request_id=%s message=%r",
-                request_id,
-                req.message,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="TARS generated an empty reply; this should not happen.",
-            )
+            logger.error("[chat_text] Empty reply for request_id=%s message=%r", request_id, req.message)
+            raise HTTPException(status_code=500, detail="TARS generated an empty reply; this should not happen.")
         latency_ms = int((time.monotonic() - start_time) * 1000)
         logger.info("[chat_text] request_id=%s OK latency_ms=%d mode=%s", request_id, latency_ms, mode)
         return ChatResponse(reply=reply, mode=mode)
     except HTTPException:
-        # Already meaningful; just re-raise
         raise
     except RuntimeError as e:
         logger.error("[chat_text] RuntimeError request_id=%s error=%s", request_id, e)
@@ -344,6 +344,87 @@ def health_check() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Session conversation memory (persisted locally as JSONL)
+# ---------------------------------------------------------------------------
+
+_SESS_DIR = Path(__file__).resolve().parents[1] / "memory" / "sessions"
+_SESS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Addition #4: per-session soft rate limiter (prevents accidental double-sends)
+_SESS_RATE_LIMIT_WINDOW_S = 3.0
+_SESS_LAST_CALL: Dict[str, float] = {}
+
+def _session_file(session_id: str) -> Path:
+    safe = "".join(ch for ch in session_id if ch.isalnum() or ch in ("-", "_"))
+    if not safe:
+        safe = "default"
+    return _SESS_DIR / f"{safe}.jsonl"
+
+def _load_session_turns(session_id: str, limit: int = 12) -> List[Dict[str, Any]]:
+    fp = _session_file(session_id)
+    if not fp.exists():
+        return []
+    turns: List[Dict[str, Any]] = []
+    try:
+        with fp.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    turns.append(json.loads(line))
+                except Exception:
+                    continue
+        return turns[-limit:]
+    except Exception:
+        return []
+
+def _append_session_turn(session_id: str, role: str, text: str) -> None:
+    fp = _session_file(session_id)
+    rec = {"role": role, "text": text, "ts": time.time()}
+    try:
+        with fp.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _build_context_block(turns: List[Dict[str, Any]], max_chars: int = 1800) -> str:
+    if not turns:
+        return ""
+    chunks: List[str] = []
+    for t in turns:
+        role = (t.get("role") or "").strip().lower()
+        text = (t.get("text") or "").strip()
+        if not text:
+            continue
+        if role == "user":
+            chunks.append(f"User: {text}")
+        elif role == "assistant":
+            chunks.append(f"TARS: {text}")
+        else:
+            chunks.append(text)
+
+    ctx = "\n".join(chunks).strip()
+    if len(ctx) > max_chars:
+        ctx = ctx[-max_chars:]
+    return ctx
+
+# Addition #3: voice-only session reset triggers
+_RESET_SESSION_PHRASES = {
+    "reset memory",
+    "new session",
+    "forget that",
+    "clear memory",
+}
+
+def _normalize_reset_phrase(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z\s]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+# ---------------------------------------------------------------------------
 # Chat endpoint (Audio)
 # ---------------------------------------------------------------------------
 
@@ -351,24 +432,36 @@ def health_check() -> dict:
 def chat_audio(req: AudioChatRequest) -> AudioChatResponse:
     """
     End-to-end audio chat:
-
       1) Decode base64 audio
-      2) STT via stt_with_safeguards (Whisper)
-      3) Optional mode override via 'mode' field
-      4) Pass transcript into TARSCore text pipeline (VOICE channel)
-      5) Apply voice reply length control
-      6) TTS via tts_with_safeguards
-      7) Return transcript + reply_text + audio
-
-    This endpoint reuses the same TARSCore logic as /chat_text and does
-    not store audio data in the DB or send it to the model.
+      2) STT via stt_with_safeguards
+      3) Optional mode override via 'mode'
+      4) Session memory: inject recent turns (JSONL) into TARSCore input
+      5) TARSCore: transcript -> reply (VOICE)
+      6) Apply voice reply length control
+      7) TTS via tts_with_safeguards
+      8) Persist session turns
     """
     request_id = str(uuid.uuid4())
     start_time = time.monotonic()
 
+    # session id (Android sends this)
+    session_id = (req.session_id or "").strip() or "default"
+
+    # Addition #4: soft rate limiter per session_id
+    now = time.time()
+    last = _SESS_LAST_CALL.get(session_id)
+    if last is not None and (now - last) < _SESS_RATE_LIMIT_WINDOW_S:
+        logger.warning(
+            "[chat_audio] request_id=%s session_id=%s rate_limited delta=%.2fs",
+            request_id, session_id, now - last,
+        )
+        raise HTTPException(status_code=429, detail="Too many requests (rate limited).")
+    _SESS_LAST_CALL[session_id] = now
+
     logger.info(
-        "[chat_audio] request_id=%s audio_b64_len=%d mime=%s lang=%s mode_hint=%s voice_style=%s",
+        "[chat_audio] request_id=%s session_id=%s audio_b64_len=%d mime=%s lang=%s mode_hint=%s voice_style=%s",
         request_id,
+        session_id,
         len(req.audio_base64),
         req.mime_type,
         req.language,
@@ -378,38 +471,40 @@ def chat_audio(req: AudioChatRequest) -> AudioChatResponse:
 
     # 1. Validate and decode base64 audio
     if not req.audio_base64 or not req.audio_base64.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Field 'audio_base64' must not be empty.",
-        )
+        raise HTTPException(status_code=400, detail="Field 'audio_base64' must not be empty.")
 
     try:
         audio_bytes = base64.b64decode(req.audio_base64, validate=True)
     except Exception as exc:
         logger.warning("[chat_audio] request_id=%s invalid base64: %s", request_id, exc)
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid 'audio_base64' payload: could not decode base64.",
-        )
+        raise HTTPException(status_code=400, detail="Invalid 'audio_base64' payload: could not decode base64.")
 
-    # 2. STT: audio -> transcript (with safeguards)
+    # 2. STT: audio -> transcript
     try:
         transcript = stt_with_safeguards(
             audio_bytes=audio_bytes,
             mime_type=req.mime_type,
-            language=req.language,  # can be None for auto-detect
+            language=req.language,
         )
     except ValueError as exc:
-        # Input-related error (empty/oversized/invalid audio)
         logger.warning("[chat_audio] request_id=%s STT validation error: %s", request_id, exc)
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
-        # Upstream/model error
         logger.error("[chat_audio] request_id=%s STT runtime error: %s", request_id, exc)
-        raise HTTPException(
-            status_code=502,
-            detail="Speech-to-text service failed.",
+        raise HTTPException(status_code=502, detail="Speech-to-text service failed.")
+
+    transcript = (transcript or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Empty transcript (no speech detected).")
+
+    # Addition #3: reset phrases rotate the session id (server-side safe reset)
+    if _normalize_reset_phrase(transcript) in _RESET_SESSION_PHRASES:
+        new_session_id = str(uuid.uuid4())
+        logger.info(
+            "[chat_audio] request_id=%s session_id=%s reset_phrase=%r -> new_session_id=%s",
+            request_id, session_id, transcript, new_session_id
         )
+        session_id = new_session_id
 
     # 3. Optional mode override
     _apply_mode_hint(req.mode)
@@ -417,78 +512,96 @@ def chat_audio(req: AudioChatRequest) -> AudioChatResponse:
     # Normalize voice_style for both TARSCore and truncation
     normalized_voice_style = _normalize_voice_style(req.voice_style)
 
-    # 4. TARSCore text pipeline: transcript -> reply (VOICE channel)
+    # Addition #1/#2: load recent turns and inject context
+    prior_turns = _load_session_turns(session_id=session_id, limit=12)
+    context_block = _build_context_block(prior_turns, max_chars=1800)
+    turn_count = len(prior_turns)
+
+    # 4. TARSCore text pipeline
     try:
+        if context_block:
+            user_text_for_core = (
+                "Conversation so far (most recent turns):\n"
+                f"{context_block}\n\n"
+                "Current user utterance:\n"
+                f"{transcript}"
+            )
+        else:
+            user_text_for_core = transcript
+
         reply = tars_core.process_user_text(
-            transcript,
+            user_text_for_core,
             channel=ResponseChannel.VOICE,
             voice_style=normalized_voice_style,
         )
         mode = tars_core.state.mode.value
+
     except RuntimeError as exc:
-        logger.error("[chat_audio] request_id=%s TARSCore error: %s", request_id, exc)
-        raise HTTPException(
-            status_code=500,
-            detail="TARS core text engine failed to process the transcript.",
-        )
+        logger.error("[chat_audio] request_id=%s session_id=%s TARSCore error: %s", request_id, session_id, exc)
+        raise HTTPException(status_code=500, detail="TARS core text engine failed to process the transcript.")
     except Exception as exc:
-        logger.error("[chat_audio] request_id=%s Unexpected TARSCore error: %s", request_id, exc)
-        raise HTTPException(
-            status_code=500,
-            detail="Unexpected error in TARS core while processing transcript.",
-        )
+        logger.error("[chat_audio] request_id=%s session_id=%s Unexpected TARSCore error: %s", request_id, session_id, exc)
+        raise HTTPException(status_code=500, detail="Unexpected error in TARS core while processing transcript.")
 
     reply = (reply or "").strip()
     if not reply:
-        logger.error(
-            "[chat_audio] request_id=%s Empty reply for transcript: %r",
-            request_id,
-            transcript,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="TARS generated an empty reply; this should not happen.",
-        )
+        logger.error("[chat_audio] request_id=%s session_id=%s Empty reply for transcript: %r", request_id, session_id, transcript)
+        raise HTTPException(status_code=500, detail="TARS generated an empty reply; this should not happen.")
+
+    # Addition #5: observability – log turn_count + context chars
+    logger.info(
+        "[chat_audio] request_id=%s session_id=%s turn_count=%d context_chars=%d transcript_len=%d reply_len=%d",
+        request_id,
+        session_id,
+        turn_count,
+        len(context_block or ""),
+        len(transcript),
+        len(reply),
+    )
 
     # 5. Apply voice reply length control BEFORE TTS
-    truncated_reply, was_truncated = _truncate_for_voice_reply(
-        reply,
-        normalized_voice_style,
-    )
+    truncated_reply, was_truncated = _truncate_for_voice_reply(reply, normalized_voice_style)
     if was_truncated:
         logger.info(
-            "[chat_audio] request_id=%s Voice reply truncated (style=%s, orig_len=%d, new_len=%d).",
+            "[chat_audio] request_id=%s session_id=%s Voice reply truncated (style=%s, orig_len=%d, new_len=%d).",
             request_id,
+            session_id,
             normalized_voice_style,
             len(reply),
             len(truncated_reply),
         )
     reply = truncated_reply
 
-    # 6. TTS: reply -> audio (with safeguards, but non-fatal)
+    # 6. TTS: reply -> audio (non-fatal)
     try:
         audio_reply_bytes = tts_with_safeguards(
             text=reply,
-            voice=None,          # later: 'tars_default' or similar from config
-            audio_format="mp3",  # must match allowed formats in audio.service
+            voice=None,          # later: 'tars_default' from config
+            audio_format="mp3",
         )
         audio_reply_base64 = base64.b64encode(audio_reply_bytes).decode("ascii")
         error = None
     except ValueError as exc:
-        # Input-related issue for TTS (e.g., text too long)
-        logger.warning("[chat_audio] request_id=%s TTS validation error: %s", request_id, exc)
+        logger.warning("[chat_audio] request_id=%s session_id=%s TTS validation error: %s", request_id, session_id, exc)
         audio_reply_base64 = ""
         error = f"tts_validation_error: {exc}"
     except RuntimeError as exc:
-        # Upstream TTS failure
-        logger.error("[chat_audio] request_id=%s TTS runtime error: %s", request_id, exc)
+        logger.error("[chat_audio] request_id=%s session_id=%s TTS runtime error: %s", request_id, session_id, exc)
         audio_reply_base64 = ""
         error = "tts_failed"
 
+    # Persist session turns (so memory survives across requests/restarts)
+    try:
+        _append_session_turn(session_id, "user", transcript)
+        _append_session_turn(session_id, "assistant", reply)
+    except Exception:
+        pass
+
     latency_ms = int((time.monotonic() - start_time) * 1000)
     logger.info(
-        "[chat_audio] request_id=%s OK latency_ms=%d mode=%s error=%s truncated=%s",
+        "[chat_audio] request_id=%s session_id=%s OK latency_ms=%d mode=%s error=%s truncated=%s",
         request_id,
+        session_id,
         latency_ms,
         mode,
         error,
@@ -522,14 +635,9 @@ def add_memory(req: MemoryAddRequest) -> MemoryItemResponse:
         source_conversation_id=req.source_conversation_id,
     )
 
-    # We need the created_at; easiest is to fetch from recent list
     items = get_recent_memory_items(limit=1)
     if not items or items[0].id != mem_id:
-        # Fallback: minimal response without created_at (unlikely)
-        logger.warning(
-            "New memory id %s not found in recent list; returning fallback response.",
-            mem_id,
-        )
+        logger.warning("New memory id %s not found in recent list; returning fallback response.", mem_id)
         return MemoryItemResponse(
             id=mem_id,
             created_at="",
@@ -551,9 +659,7 @@ def add_memory(req: MemoryAddRequest) -> MemoryItemResponse:
 
 
 @app.get("/memory/recent", response_model=List[MemoryItemResponse])
-def list_recent_memory(
-    limit: int = Query(20, ge=1, le=200)
-) -> List[MemoryItemResponse]:
+def list_recent_memory(limit: int = Query(20, ge=1, le=200)) -> List[MemoryItemResponse]:
     """
     Return the most recent memory items, any type.
     """
@@ -573,10 +679,7 @@ def list_recent_memory(
 
 @app.get("/memory/by_type", response_model=List[MemoryItemResponse])
 def list_memory_by_type(
-    type: str = Query(
-        ...,
-        description="Memory type, e.g., 'original_idea', 'project', 'position_shift'",
-    ),
+    type: str = Query(..., description="Memory type, e.g., 'original_idea', 'project', 'position_shift'"),
     limit: int = Query(50, ge=1, le=500),
 ) -> List[MemoryItemResponse]:
     """
@@ -616,5 +719,6 @@ def search_memory(
         )
         for item in items
     ]
+
 
 
